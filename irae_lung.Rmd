@@ -1,0 +1,128 @@
+```{r}
+library(Seurat)
+library(cellranger)
+library(hdf5r)
+library(harmony)
+library(SingleCellExperiment)
+library(Seurat)
+library(ggplot2)
+library(ggbeeswarm)
+library(gplots)
+library(RColorBrewer)
+library(stringr)
+```
+```{r}
+getwd()
+```
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+options(Seurat.object.assay.version = 'v5')
+start_step <- 3
+options(start_step = start_step)
+
+```
+```{r step1, eval = getOption("start_step", 1) < 2}
+print("✅ Running Step 1: Loading data...")
+# List all sample directories containing 10x data
+sample_dirs <- list.dirs("GSE216329_RAW_lung", recursive = FALSE, full.names = TRUE)
+sample_dirs <- sample_dirs[file.exists(file.path(sample_dirs, "matrix.mtx.gz"))]
+sample_dirs
+
+# Read each sample and create a Seurat object
+read_sample_as_seurat <- function(path) {
+  counts <- Seurat::Read10X(
+    data.dir = path,
+    gene.column = 2,
+    unique.features = TRUE
+  )
+  colnames(counts) <- make.unique(colnames(counts))
+  sample_id <- basename(path)
+  CreateSeuratObject(
+    counts = counts,
+    min.cells = 3,
+    min.features = 250,
+    project = sample_id
+  )
+}
+seurat_list <- lapply(sample_dirs, read_sample_as_seurat)
+
+# Merge all samples
+merged_Seurat <- merge(
+  x = seurat_list[[1]],
+  y = seurat_list[-1],
+  add.cell.ids = basename(sample_dirs),
+  project = "AllSamples"
+)
+cat("Merged", length(seurat_list), "samples. Total cells:", ncol(merged_Seurat), "\n")
+
+merged_Seurat
+saveRDS(merged_Seurat, file="irae_lung_merged_Seurat.rds")
+
+```
+```{r step2, eval = getOption("start_step", 1) < 3}
+print("✅ Running Step 2: Normalizing data...")
+merged_Seurat <- readRDS(file="irae_lung_merged_Seurat.rds")
+merged_Seurat <- NormalizeData(merged_Seurat, normalization.method ="LogNormalize", scale.factor = 10000)
+merged_Seurat <- FindVariableFeatures(merged_Seurat, selection.method = "vst", nfeatures = 2000)
+saveRDS(merged_Seurat, file="irae_lung_variable_features_Seurat.rds")
+
+```
+```{r step3, eval = getOption("start_step", 1) < 4}
+
+merged_Seurat <- readRDS(file="irae_lung_variable_features_Seurat.rds")
+merged_Seurat <- ScaleData(merged_Seurat, features = VariableFeatures(merged_Seurat), verbose=FALSE)
+saveRDS(merged_Seurat, file="irae_lung_scaled_Seurat.rds")
+```
+```{r step3, eval = getOption("start_step", 1) < 5}
+print("✅ Running Step 3: PCA and UMAP..")
+merged_Seurat <- RunPCA(merged_Seurat, features = VariableFeatures(object = merged_Seurat), npcs = 30)
+merged_Seurat <- RunUMAP(merged_Seurat,dims = 1:30, reduction = "pca")
+```
+```{r}
+PCAPlot(merged_Seurat,group.by="orig.ident",label = FALSE)
+```
+```{r}
+harmony_seurat <- RunHarmony(merged_Seurat,group.by.vars=c("orig.ident"))
+```
+```{r}
+saveRDS(merged_Seurat, file="irae_lung_seurat.RDS")
+```
+```{r}
+merged_Seurat
+```
+```{r}
+harmony_seurat
+```
+```{r}
+harmony_seurat <- RunUMAP(object=harmony_seurat,reduction="harmony",dims=1:30,verbose=FALSE)
+```
+```{r}
+n_groups <- length(unique(harmony_seurat$orig.ident))
+base_colors <- c(
+  RColorBrewer::brewer.pal(8, "Set2"),
+  RColorBrewer::brewer.pal(12, "Set3"),
+  RColorBrewer::brewer.pal(9, "Set1"),
+  RColorBrewer::brewer.pal(8, "Dark2"),
+  RColorBrewer::brewer.pal(12, "Paired")
+)
+colores_ID <- colorRampPalette(base_colors)(max(3, n_groups))
+```
+```{r}
+harmony_seurat <- FindNeighbors(object=harmony_seurat,reduction="harmony",dims=1:30,verbose=FALSE)
+harmony_seurat <- FindClusters(object=harmony_seurat,resolution=.2,verbose=T)
+```
+```{r}
+DimPlot(harmony_seurat,
+#split.by = "orig.ident",
+group.by="orig.ident",
+cols = colores_ID,
+dims = c(1, 2)) # save PDF
+```
+```{r}
+DimPlot(harmony_seurat,reduction="umap",pt.size = 1, label = TRUE, label.size = 7)
+``` 
+```{r}
+pdf("irae_lung_umap.pdf", width = 8, height = 6)
+DimPlot(harmony_seurat,reduction="umap",pt.size = 1, label = TRUE, label.size = 7)
+dev.off()
+```

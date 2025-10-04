@@ -1,0 +1,176 @@
+```{r}
+set.seed(42)
+library(Seurat)
+library(cellranger)
+library(hdf5r)
+library(harmony)
+library(SingleCellExperiment)
+library(Seurat)
+library(sctransform)
+library(ggplot2)
+library(ggbeeswarm)
+library(gplots)
+library(RColorBrewer)
+library(stringr)
+library(glmGamPoi)
+```
+```{r}
+getwd()
+```
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+start_step <- 3
+options(start_step = start_step)
+```
+```{r step1, eval = getOption("start_step", 1) < 2}
+print("✅ Running Step 1: Loading data...")
+# List all sample directories containing 10x data
+sample_dirs <- list.dirs("GSE216329_RAW", recursive = FALSE, full.names = TRUE)
+sample_dirs <- sample_dirs[file.exists(file.path(sample_dirs, "matrix.mtx.gz"))]
+
+# Read each sample and create a Seurat object
+read_sample_as_seurat <- function(path) {
+  counts <- Seurat::Read10X(
+    data.dir = path,
+    gene.column = 2,
+    unique.features = TRUE
+  )
+  colnames(counts) <- make.unique(colnames(counts))
+  sample_id <- basename(path)
+  CreateSeuratObject(
+    counts = counts,
+    min.cells = 3,
+    min.features = 250,
+    project = sample_id
+  )
+}
+seurat_list <- lapply(sample_dirs, read_sample_as_seurat)
+
+# Merge all samples
+merged_Seurat <- merge(
+  x = seurat_list[[1]],
+  y = seurat_list[-1],
+  add.cell.ids = basename(sample_dirs),
+  project = "AllSamples"
+)
+cat("Merged", length(seurat_list), "samples. Total cells:", ncol(merged_Seurat), "\n")
+
+merged_Seurat
+saveRDS(merged_Seurat, file="irae_lung_merged_Seurat.rds")
+
+```
+```{r step2_doublets, eval = getOption("start_step", 1) < 3}
+print("✅ Running Step 2: Doublet detection (scDblFinder)...")
+merged_Seurat <- readRDS(file = "irae_lung_merged_Seurat.rds")
+
+if (!requireNamespace("BiocManager", quietly = TRUE)) install.packages("BiocManager")
+if (!requireNamespace("scDblFinder", quietly = TRUE)) BiocManager::install("scDblFinder", update = FALSE, ask = FALSE)
+library(scDblFinder)
+library(SingleCellExperiment)
+
+# Use raw RNA counts for doublet detection (Seurat v5-compatible)
+# Join layers if v5 assay has multiple layers
+if (inherits(merged_Seurat[["RNA"]], "Assay5") && length(Layers(merged_Seurat[["RNA"]])) > 1) {
+  merged_Seurat[["RNA"]] <- JoinLayers(merged_Seurat[["RNA"]])
+}
+
+counts_mat <- tryCatch({
+  GetAssayData(merged_Seurat, assay = "RNA", layer = "counts")
+}, error = function(e) {
+  GetAssayData(merged_Seurat, assay = "RNA", slot = "counts")
+})
+sce <- SingleCellExperiment(list(counts = counts_mat))
+colData(sce)$orig.ident <- merged_Seurat$orig.ident[match(colnames(sce), colnames(merged_Seurat))]
+
+# Per-sample doublet detection
+sce <- scDblFinder(sce, samples = colData(sce)$orig.ident)
+
+# Map results back to Seurat and filter to singlets
+merged_Seurat$scDblFinder.class <- colData(sce)$scDblFinder.class[match(colnames(merged_Seurat), colnames(sce))]
+merged_Seurat$scDblFinder.score <- colData(sce)$scDblFinder.score[match(colnames(merged_Seurat), colnames(sce))]
+print(table(merged_Seurat$scDblFinder.class))
+
+total_before <- ncol(merged_Seurat)
+doublet_n <- sum(merged_Seurat$scDblFinder.class == "doublet", na.rm = TRUE)
+singlet_n <- sum(merged_Seurat$scDblFinder.class == "singlet", na.rm = TRUE)
+removed_pct <- if (total_before > 0) round(100 * doublet_n / total_before, 2) else NA_real_
+cat("Doublets identified:", doublet_n, "of", total_before, sprintf("(%0.2f%%)", removed_pct), "\n")
+
+merged_Seurat <- subset(merged_Seurat, subset = scDblFinder.class == "singlet")
+cat("Remaining singlets:", ncol(merged_Seurat), "\n")
+saveRDS(merged_Seurat, file = "irae_lung_merged_Seurat_singlets.rds")
+```
+```{r step3, eval = getOption("start_step", 1) < 4}
+print("✅ Running Step 3: SCTransform (memory-optimized)...")
+if (file.exists("irae_lung_merged_Seurat_singlets.rds")) {
+  merged_Seurat <- readRDS(file = "irae_lung_merged_Seurat_singlets.rds")
+} else {
+  merged_Seurat <- readRDS(file = "irae_lung_merged_Seurat.rds")
+}
+use_glmGamPoi <- requireNamespace("glmGamPoi", quietly = TRUE)
+if (use_glmGamPoi) {
+  merged_Seurat <- SCTransform(
+    merged_Seurat,
+    conserve.memory = TRUE,
+    variable.features.n = 3000,
+    # return.only.var.genes = TRUE,
+    verbose = TRUE,
+    method = "glmGamPoi"
+  )
+} else {
+  merged_Seurat <- SCTransform(
+    merged_Seurat,
+    conserve.memory = TRUE,
+    variable.features.n = 3000,
+    # return.only.var.genes = TRUE,
+    verbose = TRUE
+  )
+}
+saveRDS(merged_Seurat, file="irae_lung_sct_Seurat.rds")
+
+```
+```{r step4_sct_load, eval = getOption("start_step", 1) < 5}
+
+merged_Seurat <- readRDS(file="irae_lung_sct_Seurat.rds")
+DefaultAssay(merged_Seurat) <- "SCT"
+print("✅ Running Step 4: PCA and UMAP (SCT)..")
+# if (nrow(GetAssayData(merged_Seurat, assay = "SCT", slot = "scale.data")) == 0) {
+#   message("scale.data for SCT is empty; running ScaleData to populate it…")
+#   merged_Seurat <- ScaleData(
+#     merged_Seurat,
+#     assay = "SCT",
+#     features = VariableFeatures(merged_Seurat),
+#     verbose = FALSE
+#   )
+# }
+merged_Seurat <- RunPCA(
+  merged_Seurat,
+  assay = "SCT",
+  features = VariableFeatures(merged_Seurat),
+  npcs = 30,
+  verbose = FALSE
+)
+set.seed(42)
+merged_Seurat <- RunUMAP(
+  merged_Seurat,
+  dims = 1:30,
+  reduction = "pca",
+  n.neighbors = 30,
+  min.dist = 0.3
+)
+saveRDS(merged_Seurat, file="irae_lung_umap_seurat.rds")
+```
+```{r echo=FALSE}
+PCAPlot(merged_Seurat,group.by="orig.ident",label = FALSE)
+```
+```{r}
+harmony_seurat <- RunHarmony(merged_Seurat, group.by.vars = c("orig.ident"), reduction.save = "harmony")
+saveRDS(harmony_seurat, file="irae_lung_harmony_seurat.rds")
+
+```
+```{r}
+merged_Seurat
+```
+```{r}
+harmony_seurat
+```

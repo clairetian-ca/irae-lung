@@ -1,0 +1,307 @@
+---
+title: "irAE Lung Cancer Manipulation 5"
+output: html_notebook
+---
+Cluster and annotate markers
+
+
+```{r}
+library(cellranger)
+library(hdf5r)
+library(harmony)
+library(SingleCellExperiment)
+library(Seurat)
+library(ggplot2)
+library(ggbeeswarm)
+library(gplots)
+library(RColorBrewer)
+```
+```{r}
+harmony_seurat <- readRDS(file="irae_lung_harmony_seurat.rds")
+```
+<!-- ```{r}
+# Summary of dataset, samples, groups, and clusters
+default_assay <- DefaultAssay(harmony_seurat)
+num_cells <- ncol(harmony_seurat)
+num_genes <- nrow(harmony_seurat)
+num_samples <- length(unique(harmony_seurat$orig.ident))
+
+meta_cols <- colnames(harmony_seurat[[]])
+if (!"group" %in% meta_cols) {
+  idents <- unique(harmony_seurat$orig.ident)
+  group_mapping <- setNames(
+    ifelse(grepl("_TN$", idents), "TN",
+           ifelse(grepl("_T$", idents), "T", NA_character_)),
+    idents
+  )
+  harmony_seurat$group <- unname(group_mapping[as.character(harmony_seurat$orig.ident)])
+}
+num_groups <- length(unique(na.omit(harmony_seurat$group)))
+
+clusters_available <- "seurat_clusters" %in% meta_cols
+num_clusters <- if (clusters_available) length(unique(harmony_seurat$seurat_clusters)) else NA_integer_
+
+cat(paste0(
+  "Cells: ", num_cells, "\n",
+  "Genes (", default_assay, "): ", num_genes, "\n",
+  "Samples: ", num_samples, "\n",
+  "Groups: ", num_groups, if (any(is.na(harmony_seurat$group))) " (with NAs)" else "", "\n",
+  "Clusters: ", if (clusters_available) num_clusters else "not yet computed", "\n"
+))
+
+cat("\nCells per sample (orig.ident):\n")
+print(sort(table(harmony_seurat$orig.ident), decreasing = TRUE))
+
+cat("\nCells per group:\n")
+print(sort(table(harmony_seurat$group), decreasing = TRUE))
+
+if (clusters_available) {
+  cat("\nCells by group x cluster:\n")
+  print(table(harmony_seurat$group, harmony_seurat$seurat_clusters))
+}
+``` -->
+
+run harmony UMAP
+```{r}
+set.seed(42)
+```
+
+```{r}
+n_groups <- length(unique(harmony_seurat$orig.ident))
+base_colors <- c(
+  RColorBrewer::brewer.pal(8, "Set2"),
+  RColorBrewer::brewer.pal(12, "Set3"),
+  RColorBrewer::brewer.pal(9, "Set1"),
+  RColorBrewer::brewer.pal(8, "Dark2"),
+  RColorBrewer::brewer.pal(12, "Paired")
+)
+colores_ID <- colorRampPalette(base_colors)(max(3, n_groups))
+
+# colores_ID=c("#CC0000","#A6CEE3","#1F78B4",
+# "#B2DF8A","#33A02C","orange","#536771","#2d1e60","#7c9c60",
+# "#d2ded5","gray", "#006600", "#000000", "#00CCCC","#cce0cc", "yellow", "lavender", "goldenrod", "hotpink", "slateblue", "plum", "red", "blue", "palevioletred", "darkkhaki", "gold", "papayawhip", "sienna", "orangered", "brown")
+```
+
+find neighbors UMAP
+```{r}
+harmony_seurat <- FindNeighbors(
+  object = harmony_seurat,
+  reduction = "harmony",
+  dims = 1:30,
+  k.param = 30,
+  verbose = FALSE
+)
+harmony_seurat <- FindClusters(
+  object = harmony_seurat,
+  resolution = .2,
+  random.seed = 42,
+  verbose = TRUE
+) # watch out for resolution here
+```
+
+```{r}
+DimPlot(harmony_seurat,
+#split.by = "orig.ident",
+reduction="harmony",
+group.by="orig.ident",
+dims = c(1, 2)) # save PDF
+```
+
+
+```{r}
+set.seed(42)
+harmony_seurat <- RunUMAP(
+  object = harmony_seurat,
+  reduction = "harmony",
+  dims = 1:30,
+  n.neighbors = 30,
+  min.dist = 0.3,
+  verbose = FALSE
+)
+DimPlot(harmony_seurat, reduction="umap", pt.size = 1, label = TRUE, label.size = 7)
+```
+
+
+
+```{r}
+pdf("irae_lung_umap.pdf", width = 8, height = 6)
+DimPlot(harmony_seurat,reduction="umap",pt.size = 1, label = TRUE, label.size = 7)
+dev.off()
+```
+
+special umap
+
+```{r}
+# # (optional) make sure identities are the clusters you want to filter on
+# Idents(harmony_seurat) <- "seurat_clusters"   # or your clustering column
+# 
+# # clusters to DROP
+# drop <- c("7","8","9")
+# 
+# # keep everything else
+# keep <- setdiff(levels(harmony_seurat), drop)
+# obj_sub <- subset(harmony_seurat, idents = keep)
+# 
+# # UMAP without those clusters
+# DimPlot(obj_sub, reduction = "umap", pt.size = 1, label = TRUE, label.size = 7)
+```
+
+```{r}
+# pdf("csf_umap_with_drop.pdf", width = 8, height = 6)
+# DimPlot(obj_sub, reduction = "umap", pt.size = 1, label = TRUE, label.size = 7)
+# dev.off()
+```
+
+
+```{r}
+idents <- unique(harmony_seurat$orig.ident)
+group_mapping <- setNames(
+  ifelse(grepl("_TN$", idents), "TN",
+         ifelse(grepl("_T$", idents), "T", NA_character_)),
+  idents
+)
+harmony_seurat$group <- unname(group_mapping[as.character(harmony_seurat$orig.ident)])
+seurat_T <- subset(harmony_seurat, subset = group == "T")
+seurat_TN <- subset(harmony_seurat, subset = group == "TN")
+```
+
+
+```{r}
+harmony_seurat$group <- as.character(group_mapping[as.character(harmony_seurat$orig.ident)])
+```
+
+```{r}
+saveRDS(harmony_seurat, file="harmony_seurat_cluster.rds")
+```
+
+
+```{r}
+seurat_T <- subset(harmony_seurat, subset = group == "T")
+seurat_TN <- subset(harmony_seurat, subset = group == "TN")
+```
+
+```{r echo=FALSE}
+pdf("umap_plots.pdf", width = 8, height = 6)
+
+DimPlot(harmony_seurat,reduction="umap",pt.size = 1, label = TRUE, group.by = "seurat_clusters", label.size = 7) + ggtitle("UMAP")
+DimPlot(seurat_T, reduction = "umap", pt.size = 1, label = TRUE, group.by = "seurat_clusters", label.size = 7) + ggtitle("T")
+DimPlot(seurat_TN, reduction = "umap", pt.size = 1, label = TRUE, group.by = "seurat_clusters", label.size = 7) + ggtitle("TN")
+
+dev.off()
+```
+
+```{r}
+table_all <- table(harmony_seurat$group, Idents(harmony_seurat))
+table_all
+```
+
+```{r}
+# table_013 <- table(cluster_013$group, Idents(cluster_013))
+# table_013
+```
+```{r}
+# table_25 <- table(cluster_25$group, Idents(cluster_25))
+# table_25
+```
+
+```{r}
+write.csv(table_all, "cell_counts_all.csv")
+# write.csv(table_013, "cell_counts_013.csv")
+# write.csv(table_25, "cell_counts_25.csv")
+```
+
+
+
+```{r}
+# harmony_seurat <- JoinLayers(harmony_seurat) # no need, since SCTAssay is v4 style and not layered
+
+DefaultAssay(harmony_seurat) <- "SCT"
+harmony_seurat <- PrepSCTFindMarkers(harmony_seurat)
+markers <- FindAllMarkers(harmony_seurat, only.pos = TRUE, min.pct = 0.25,
+logfc.threshold = 0.25,slot = "data",test.use ="wilcox",return.thresh = 0.1)
+```
+
+```{r}
+library(dplyr)
+```
+
+```{r}
+annotations <- read.csv("../annotation.csv")
+```
+
+```{r}
+head(annotations)
+```
+
+```{r}
+head(markers)
+```
+
+```{r}
+data_annot <- merge(markers,
+  unique(annotations[, c("description", "gene_name")]),
+  by.x = "gene", by.y = "gene_name",
+  all.x = TRUE)
+```
+
+
+```{r}
+data_annot <- data_annot[
+  !is.na(data_annot$description) &                                  # Remove NAs
+  data_annot$description != "" &                                    # Remove empty strings
+  !grepl("cDNA", data_annot$description, ignore.case = TRUE),       # Filter out "cDNA"
+]
+```
+
+```{r}
+top200_markers <- data_annot %>%
+  filter(p_val_adj < 0.05) %>%        # Filter significant markers
+  group_by(cluster) %>%
+  slice_max(order_by = avg_log2FC, n = 200) %>%
+  ungroup()
+
+# View the result
+head(top200_markers)
+```
+```{r}
+install.packages("writexl")
+```
+
+
+```{r}
+library(writexl)
+write_xlsx(top200_markers, "top_200_markers.xlsx")
+```
+
+```{r}
+features_oct03 <- c(
+"CD4", "CD40LG", # CD4 T cell
+"CD8A","CD8B", # CD8 T cell
+"CD68","MRC1","MSR1",  "MARCO", # Macrophage
+"CD79A","IGHG1","IGHM", # B cell
+"CD14","CSF3R","FCGR3A", # Monocyte
+"CSF1","CSF1R", # Fibroblast
+"KIT", "FCER1A","HDC" # Mast cell
+)
+
+# Open PDF with 8x6 dimensions (in inches)
+pdf("FeaturePlots_Oct03.pdf", width = 8, height = 6)
+
+# Loop through features and print plots one by one
+for (gene in features_oct03) {
+  p <- FeaturePlot(
+    object = harmony_seurat,
+    features = gene,
+    order = TRUE,
+    min.cutoff = 'q10',
+    max.cutoff = "q99",
+    label = TRUE,
+    repel = TRUE
+  )
+  
+  print(p)
+}
+
+# Close PDF device
+dev.off()
+```
