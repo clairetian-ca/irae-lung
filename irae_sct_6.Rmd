@@ -1,3 +1,9 @@
+---
+title: "irAE Lung Cancer Doublet Removal and SCTransform"
+output: html_notebook
+---
+Doublet removal and SCTransform
+
 ```{r}
 set.seed(42)
 library(Seurat)
@@ -19,8 +25,179 @@ getwd()
 ```
 ```{r setup, include=FALSE}
 knitr::opts_chunk$set(echo = TRUE)
-start_step <- 3
+start_step <- 2
 options(start_step = start_step)
+```
+```{r helpers_doublets, include=FALSE}
+# Helper functions for doublet detection and validation
+
+ensure_pkg <- function(pkg, bioc = FALSE) {
+  if (!requireNamespace(pkg, quietly = TRUE)) {
+    if (bioc) {
+      if (!requireNamespace("BiocManager", quietly = TRUE)) install.packages("BiocManager")
+      BiocManager::install(pkg, update = FALSE, ask = FALSE)
+    } else {
+      install.packages(pkg)
+    }
+  }
+  suppressPackageStartupMessages(library(pkg, character.only = TRUE))
+}
+
+# Run scDblFinder on a Seurat object; returns list(seurat, sce)
+run_scDblFinder_on_seurat <- function(seurat_obj,
+                                      sample_col = "orig.ident",
+                                      dbr = NULL,
+                                      seed = 42,
+                                      verbose = TRUE) {
+  set.seed(seed)
+  ensure_pkg("SingleCellExperiment", bioc = TRUE)
+  ensure_pkg("scDblFinder", bioc = TRUE)
+
+  # Use raw RNA counts for doublet detection; join layers if needed (Seurat v5)
+  if (inherits(seurat_obj[["RNA"]], "Assay5")) {
+    if (length(Layers(seurat_obj[["RNA"]])) > 1) {
+      seurat_obj[["RNA"]] <- JoinLayers(seurat_obj[["RNA"]])
+    }
+  }
+
+  counts_mat <- tryCatch({
+    GetAssayData(seurat_obj, assay = "RNA", layer = "counts")
+  }, error = function(e) {
+    GetAssayData(seurat_obj, assay = "RNA", slot = "counts")
+  })
+
+  sce <- SingleCellExperiment(list(counts = counts_mat))
+  if (!is.null(sample_col) && sample_col %in% colnames(seurat_obj@meta.data)) {
+    meta <- seurat_obj@meta.data
+    idx <- match(colnames(sce), rownames(meta))
+    colData(sce)[[sample_col]] <- as.character(meta[idx, sample_col, drop = TRUE])
+  } else {
+    sample_col <- NULL
+  }
+
+  if (verbose) {
+    message("Running scDblFinder (per-sample = ", !is.null(sample_col), ") …")
+  }
+  sce <- scDblFinder(sce, samples = if (!is.null(sample_col)) colData(sce)[[sample_col]] else NULL, dbr = dbr)
+
+  # Map results back
+  seurat_obj$scDblFinder.class <- colData(sce)$scDblFinder.class[match(colnames(seurat_obj), colnames(sce))]
+  seurat_obj$scDblFinder.score <- colData(sce)$scDblFinder.score[match(colnames(seurat_obj), colnames(sce))]
+
+  list(seurat = seurat_obj, sce = sce)
+}
+
+# Summaries and QC-based validation of doublet calls
+validate_doublet_removal_scDblFinder <- function(seurat_obj,
+                                                 class_col = "scDblFinder.class",
+                                                 sample_col = "orig.ident",
+                                                 out_prefix = "scDblFinder") {
+  if (is.null(seurat_obj[[class_col]])) {
+    stop("Missing class column ", class_col)
+  }
+
+  # Overall class counts
+  cls_tbl <- table(seurat_obj[[class_col]], useNA = "ifany")
+  print(cls_tbl)
+
+  # Per-sample rates (if available)
+  if (!is.null(seurat_obj[[sample_col]])) {
+    tab <- table(seurat_obj@meta.data[[sample_col]], seurat_obj@meta.data[[class_col]])
+    per_sample <- as.data.frame.matrix(tab)
+    if (!"doublet" %in% colnames(per_sample)) per_sample$doublet <- 0
+    per_sample$total <- rowSums(per_sample)
+    per_sample$doublet_rate <- ifelse(per_sample$total > 0, round(100 * per_sample$doublet / per_sample$total, 2), NA_real_)
+    per_sample$sample <- rownames(per_sample)
+    per_sample <- per_sample[order(-per_sample$doublet_rate), , drop = FALSE]
+    print(per_sample)
+    try(utils::write.csv(per_sample, file = paste0(out_prefix, "_per_sample_rates.csv"), row.names = FALSE), silent = TRUE)
+  }
+
+  # Compute common QC metrics if not present
+  if (!"percent.mt" %in% colnames(seurat_obj@meta.data)) {
+    seurat_obj[["percent.mt"]] <- PercentageFeatureSet(seurat_obj, pattern = "^MT-")
+  }
+
+  # Violin plots comparing singlets vs doublets (only for present metadata)
+  feat_meta <- intersect(c("nFeature_RNA", "nCount_RNA", "percent.mt"), colnames(seurat_obj@meta.data))
+  if (length(feat_meta) > 0) {
+    v1 <- try(VlnPlot(seurat_obj, features = feat_meta,
+                      group.by = class_col, pt.size = 0.1, combine = TRUE), silent = TRUE)
+    if (!inherits(v1, "try-error")) print(v1)
+  }
+
+  invisible(seurat_obj)
+}
+
+# DoubletFinder wrapper (works with SCT or RNA)
+run_DoubletFinder <- function(seurat_obj,
+                              PCs = 1:30,
+                              pN = 0.25,
+                              pK = NULL,
+                              expRate = NULL,
+                              use_sct = TRUE,
+                              seed = 42,
+                              verbose = TRUE) {
+  set.seed(seed)
+  ensure_pkg("DoubletFinder")
+
+  # Ensure embeddings exist
+  if (use_sct) {
+    DefaultAssay(seurat_obj) <- "SCT"
+    if (!"pca" %in% names(seurat_obj@reductions)) {
+      seurat_obj <- RunPCA(seurat_obj, assay = "SCT", features = VariableFeatures(seurat_obj), npcs = max(PCs), verbose = FALSE)
+    }
+  } else {
+    DefaultAssay(seurat_obj) <- "RNA"
+    if (is.null(seurat_obj@assays$RNA@data) || nrow(seurat_obj@assays$RNA@data) == 0) {
+      seurat_obj <- NormalizeData(seurat_obj, verbose = FALSE)
+      seurat_obj <- FindVariableFeatures(seurat_obj, verbose = FALSE)
+      seurat_obj <- ScaleData(seurat_obj, verbose = FALSE)
+    }
+    if (!"pca" %in% names(seurat_obj@reductions)) {
+      seurat_obj <- RunPCA(seurat_obj, assay = "RNA", features = VariableFeatures(seurat_obj), npcs = max(PCs), verbose = FALSE)
+    }
+  }
+
+  # Parameter sweep to get pK if not provided
+  if (is.null(pK)) {
+    sweep.res.list <- paramSweep_v3(seurat_obj, PCs = PCs, sct = use_sct)
+    sweep.stats <- summarizeSweep(sweep.res.list, GT = FALSE)
+    bcmvn <- find.pK(sweep.stats)
+    pK <- as.numeric(as.character(bcmvn$pK[which.max(bcmvn$BCmetric)]))
+    if (verbose) message("Selected pK = ", pK)
+  }
+
+  # Expected rate -> expected count; if scDblFinder already ran, reuse its observed rate
+  if (is.null(expRate)) {
+    if (!is.null(seurat_obj$scDblFinder.class)) {
+      expRate <- mean(seurat_obj$scDblFinder.class == "doublet", na.rm = TRUE)
+    } else {
+      expRate <- 0.05
+    }
+  }
+  nExp_poi <- round(expRate * ncol(seurat_obj))
+
+  # Adjust for homotypic doublets
+  if (is.null(seurat_obj$seurat_clusters)) {
+    seurat_obj <- FindNeighbors(seurat_obj, dims = PCs, verbose = FALSE)
+    seurat_obj <- FindClusters(seurat_obj, verbose = FALSE)
+  }
+  homotypic.prop <- modelHomotypic(seurat_obj$seurat_clusters)
+  nExp <- round(nExp_poi * (1 - homotypic.prop))
+
+  seurat_obj <- doubletFinder_v3(seurat_obj, PCs = PCs, pN = pN, pK = pK, nExp = nExp, reuse.pANN = FALSE, sct = use_sct)
+
+  # Identify the generated metadata column names
+  df_class_col <- grep("^DF.classifications_", colnames(seurat_obj@meta.data), value = TRUE)
+  df_pANN_col  <- grep("^pANN_", colnames(seurat_obj@meta.data), value = TRUE)
+  if (length(df_class_col) > 0) names(df_class_col) <- NULL
+  if (length(df_pANN_col) > 0) names(df_pANN_col) <- NULL
+
+  list(seurat = seurat_obj, df_class_col = if (length(df_class_col) > 0) df_class_col[[1]] else NA_character_,
+       pANN_col = if (length(df_pANN_col) > 0) df_pANN_col[[1]] else NA_character_,
+       pK = pK, nExp = nExp)
+}
 ```
 ```{r step1, eval = getOption("start_step", 1) < 2}
 print("✅ Running Step 1: Loading data...")
@@ -63,39 +240,27 @@ saveRDS(merged_Seurat, file="irae_lung_merged_Seurat.rds")
 print("✅ Running Step 2: Doublet detection (scDblFinder)...")
 merged_Seurat <- readRDS(file = "irae_lung_merged_Seurat.rds")
 
-if (!requireNamespace("BiocManager", quietly = TRUE)) install.packages("BiocManager")
-if (!requireNamespace("scDblFinder", quietly = TRUE)) BiocManager::install("scDblFinder", update = FALSE, ask = FALSE)
-library(scDblFinder)
-library(SingleCellExperiment)
+# Run scDblFinder (per-sample) via helper and validate
+res_dbl <- run_scDblFinder_on_seurat(merged_Seurat, sample_col = "orig.ident", dbr = 0.01)
+merged_Seurat <- res_dbl$seurat
+```
+```{r}
+# Validation summaries and QC plots
+validate_doublet_removal_scDblFinder(merged_Seurat, class_col = "scDblFinder.class", sample_col = "orig.ident")
 
-# Use raw RNA counts for doublet detection (Seurat v5-compatible)
-# Join layers if v5 assay has multiple layers
-if (inherits(merged_Seurat[["RNA"]], "Assay5") && length(Layers(merged_Seurat[["RNA"]])) > 1) {
-  merged_Seurat[["RNA"]] <- JoinLayers(merged_Seurat[["RNA"]])
-}
-
-counts_mat <- tryCatch({
-  GetAssayData(merged_Seurat, assay = "RNA", layer = "counts")
-}, error = function(e) {
-  GetAssayData(merged_Seurat, assay = "RNA", slot = "counts")
-})
-sce <- SingleCellExperiment(list(counts = counts_mat))
-colData(sce)$orig.ident <- merged_Seurat$orig.ident[match(colnames(sce), colnames(merged_Seurat))]
-
-# Per-sample doublet detection
-sce <- scDblFinder(sce, samples = colData(sce)$orig.ident)
-
-# Map results back to Seurat and filter to singlets
-merged_Seurat$scDblFinder.class <- colData(sce)$scDblFinder.class[match(colnames(merged_Seurat), colnames(sce))]
-merged_Seurat$scDblFinder.score <- colData(sce)$scDblFinder.score[match(colnames(merged_Seurat), colnames(sce))]
-print(table(merged_Seurat$scDblFinder.class))
+# Persist labels to file for later cross-method comparisons
+label_df <- data.frame(cell = colnames(merged_Seurat),
+                       scDblFinder.class = merged_Seurat$scDblFinder.class,
+                       scDblFinder.score = merged_Seurat$scDblFinder.score,
+                       orig.ident = merged_Seurat$orig.ident)
+try(utils::write.csv(label_df, file = "scDblFinder_cell_labels.csv", row.names = FALSE), silent = TRUE)
 
 total_before <- ncol(merged_Seurat)
 doublet_n <- sum(merged_Seurat$scDblFinder.class == "doublet", na.rm = TRUE)
-singlet_n <- sum(merged_Seurat$scDblFinder.class == "singlet", na.rm = TRUE)
 removed_pct <- if (total_before > 0) round(100 * doublet_n / total_before, 2) else NA_real_
 cat("Doublets identified:", doublet_n, "of", total_before, sprintf("(%0.2f%%)", removed_pct), "\n")
 
+# Filter to singlets and save
 merged_Seurat <- subset(merged_Seurat, subset = scDblFinder.class == "singlet")
 cat("Remaining singlets:", ncol(merged_Seurat), "\n")
 saveRDS(merged_Seurat, file = "irae_lung_merged_Seurat_singlets.rds")
