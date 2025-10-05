@@ -285,7 +285,7 @@ features_oct03 <- c(
 )
 
 # Open PDF with 8x6 dimensions (in inches)
-pdf("FeaturePlots_Oct03.pdf", width = 8, height = 6)
+pdf("FeaturePlots.pdf", width = 8, height = 6)
 
 # Loop through features and print plots one by one
 for (gene in features_oct03) {

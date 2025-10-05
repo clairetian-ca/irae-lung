@@ -76,9 +76,17 @@ run_scDblFinder_on_seurat <- function(seurat_obj,
   }
 
   if (verbose) {
-    message("Running scDblFinder (per-sample = ", !is.null(sample_col), ") …")
+    cat("Running scDblFinder (per-sample = ", !is.null(sample_col), ") …\n")
   }
-  sce <- scDblFinder(sce, samples = if (!is.null(sample_col)) colData(sce)[[sample_col]] else NULL, dbr = dbr)
+  if (isTRUE(verbose)) {
+    sce <- scDblFinder(sce, samples = if (!is.null(sample_col)) colData(sce)[[sample_col]] else NULL, dbr = dbr)
+  } else {
+    suppressWarnings({
+      invisible(capture.output({
+        sce <- scDblFinder(sce, samples = if (!is.null(sample_col)) colData(sce)[[sample_col]] else NULL, dbr = dbr)
+      }, type = "output"))
+    })
+  }
 
   # Map results back
   seurat_obj$scDblFinder.class <- colData(sce)$scDblFinder.class[match(colnames(seurat_obj), colnames(sce))]
@@ -91,7 +99,8 @@ run_scDblFinder_on_seurat <- function(seurat_obj,
 validate_doublet_removal_scDblFinder <- function(seurat_obj,
                                                  class_col = "scDblFinder.class",
                                                  sample_col = "orig.ident",
-                                                 out_prefix = "scDblFinder") {
+                                                 out_prefix = "scDblFinder",
+                                                 verbose = FALSE) {
   if (is.null(seurat_obj[[class_col]])) {
     stop("Missing class column ", class_col)
   }
@@ -122,7 +131,7 @@ validate_doublet_removal_scDblFinder <- function(seurat_obj,
   feat_meta <- intersect(c("nFeature_RNA", "nCount_RNA", "percent.mt"), colnames(seurat_obj@meta.data))
   if (length(feat_meta) > 0) {
     v1 <- try(VlnPlot(seurat_obj, features = feat_meta,
-                      group.by = class_col, pt.size = 0.1, combine = TRUE), silent = TRUE)
+                      group.by = class_col, pt.size = 0.01, combine = TRUE), silent = TRUE)
     if (!inherits(v1, "try-error")) print(v1)
   }
 
@@ -245,8 +254,8 @@ res_dbl <- run_scDblFinder_on_seurat(merged_Seurat, sample_col = "orig.ident", d
 merged_Seurat <- res_dbl$seurat
 ```
 ```{r}
-# Validation summaries and QC plots
-validate_doublet_removal_scDblFinder(merged_Seurat, class_col = "scDblFinder.class", sample_col = "orig.ident")
+# Validation summaries and QC plots (quiet)
+validate_doublet_removal_scDblFinder(merged_Seurat, class_col = "scDblFinder.class", sample_col = "orig.ident", verbose = FALSE)
 
 # Persist labels to file for later cross-method comparisons
 label_df <- data.frame(cell = colnames(merged_Seurat),
@@ -259,16 +268,17 @@ total_before <- ncol(merged_Seurat)
 doublet_n <- sum(merged_Seurat$scDblFinder.class == "doublet", na.rm = TRUE)
 removed_pct <- if (total_before > 0) round(100 * doublet_n / total_before, 2) else NA_real_
 cat("Doublets identified:", doublet_n, "of", total_before, sprintf("(%0.2f%%)", removed_pct), "\n")
+saveRDS(merged_Seurat, file = "irae_lung_merged_Seurat_dbls.rds")
 
-# Filter to singlets and save
-merged_Seurat <- subset(merged_Seurat, subset = scDblFinder.class == "singlet")
-cat("Remaining singlets:", ncol(merged_Seurat), "\n")
-saveRDS(merged_Seurat, file = "irae_lung_merged_Seurat_singlets.rds")
+# stop()
 ```
 ```{r step3, eval = getOption("start_step", 1) < 4}
 print("✅ Running Step 3: SCTransform (memory-optimized)...")
-if (file.exists("irae_lung_merged_Seurat_singlets.rds")) {
-  merged_Seurat <- readRDS(file = "irae_lung_merged_Seurat_singlets.rds")
+if (file.exists("irae_lung_merged_Seurat_dbls.rds")) {
+  merged_Seurat <- readRDS(file = "irae_lung_merged_Seurat_dbls.rds")
+  # Filter to singlets
+  merged_Seurat <- subset(merged_Seurat, subset = scDblFinder.class == "singlet")
+  cat("Remaining doublets:", ncol(merged_Seurat), "\n")
 } else {
   merged_Seurat <- readRDS(file = "irae_lung_merged_Seurat.rds")
 }
