@@ -131,7 +131,7 @@ validate_doublet_removal_scDblFinder <- function(seurat_obj,
   feat_meta <- intersect(c("nFeature_RNA", "nCount_RNA", "percent.mt"), colnames(seurat_obj@meta.data))
   if (length(feat_meta) > 0) {
     v1 <- try(VlnPlot(seurat_obj, features = feat_meta,
-                      group.by = class_col, pt.size = 0.01, combine = TRUE), silent = TRUE)
+                      group.by = class_col, pt.size = 0, combine = TRUE), silent = TRUE)
     if (!inherits(v1, "try-error")) print(v1)
   }
 
@@ -250,10 +250,16 @@ print("✅ Running Step 2: Doublet detection (scDblFinder)...")
 merged_Seurat <- readRDS(file = "irae_lung_merged_Seurat.rds")
 
 # Run scDblFinder (per-sample) via helper and validate
-res_dbl <- run_scDblFinder_on_seurat(merged_Seurat, sample_col = "orig.ident", dbr = 0.01)
+res_dbl <- run_scDblFinder_on_seurat(merged_Seurat, sample_col = "orig.ident") #, dbr = 0.01)
 merged_Seurat <- res_dbl$seurat
+
+total_before <- ncol(merged_Seurat)
+doublet_n <- sum(merged_Seurat$scDblFinder.class == "doublet", na.rm = TRUE)
+removed_pct <- if (total_before > 0) round(100 * doublet_n / total_before, 2) else NA_real_
+cat("Doublets identified:", doublet_n, "of", total_before, sprintf("(%0.2f%%)", removed_pct), "\n")
+saveRDS(merged_Seurat, file = "irae_lung_merged_Seurat_dbls.rds")
 ```
-```{r}
+```{r step3, eval = getOption("start_step", 1) < 4}
 # Validation summaries and QC plots (quiet)
 validate_doublet_removal_scDblFinder(merged_Seurat, class_col = "scDblFinder.class", sample_col = "orig.ident", verbose = FALSE)
 
@@ -264,15 +270,43 @@ label_df <- data.frame(cell = colnames(merged_Seurat),
                        orig.ident = merged_Seurat$orig.ident)
 try(utils::write.csv(label_df, file = "scDblFinder_cell_labels.csv", row.names = FALSE), silent = TRUE)
 
-total_before <- ncol(merged_Seurat)
-doublet_n <- sum(merged_Seurat$scDblFinder.class == "doublet", na.rm = TRUE)
-removed_pct <- if (total_before > 0) round(100 * doublet_n / total_before, 2) else NA_real_
-cat("Doublets identified:", doublet_n, "of", total_before, sprintf("(%0.2f%%)", removed_pct), "\n")
-saveRDS(merged_Seurat, file = "irae_lung_merged_Seurat_dbls.rds")
 
-# stop()
+
+  # --- Additional sanity checks ---
+  # 1) Median QC metrics by class (singlet/doublet)
+  qc_cols <- intersect(c("nFeature_RNA", "nCount_RNA", "percent.mt"), colnames(merged_Seurat@meta.data))
+  if (length(qc_cols) > 0) {
+    med_summ <- sapply(qc_cols, function(f) tapply(merged_Seurat@meta.data[[f]],
+                                                   merged_Seurat$scDblFinder.class,
+                                                   median, na.rm = TRUE))
+    med_summ <- as.data.frame(med_summ)
+    med_summ$class <- rownames(med_summ)
+    med_summ <- med_summ[, c("class", qc_cols), drop = FALSE]
+    print(med_summ)
+  }
+
+  # 2) Per-sample doublet rate (percent)
+  if (!is.null(merged_Seurat$orig.ident)) {
+    per_sample_rate <- tapply(merged_Seurat$scDblFinder.class == "doublet",
+                              merged_Seurat$orig.ident,
+                              function(x) mean(x, na.rm = TRUE))
+    per_sample_rate <- sort(per_sample_rate, decreasing = TRUE)
+    cat("Per-sample doublet rates (%):\n")
+    print(round(100 * per_sample_rate, 2))
+  }
+
+  # 3) Score separation and violin plot for scDblFinder.score
+  if ("scDblFinder.score" %in% colnames(merged_Seurat@meta.data)) {
+    cat("scDblFinder.score summary by class:\n")
+    print(tapply(merged_Seurat$scDblFinder.score,
+                 merged_Seurat$scDblFinder.class, summary))
+    try(print(VlnPlot(merged_Seurat, features = "scDblFinder.score",
+                      group.by = "scDblFinder.class", pt.size = 0)), silent = TRUE)
+  }
+
+knitr::knit_exit()
 ```
-```{r step3, eval = getOption("start_step", 1) < 4}
+```{r step4, eval = getOption("start_step", 1) < 5}
 print("✅ Running Step 3: SCTransform (memory-optimized)...")
 if (file.exists("irae_lung_merged_Seurat_dbls.rds")) {
   merged_Seurat <- readRDS(file = "irae_lung_merged_Seurat_dbls.rds")
@@ -304,7 +338,7 @@ if (use_glmGamPoi) {
 saveRDS(merged_Seurat, file="irae_lung_sct_Seurat.rds")
 
 ```
-```{r step4_sct_load, eval = getOption("start_step", 1) < 5}
+```{r step5, eval = getOption("start_step", 1) < 6}
 
 merged_Seurat <- readRDS(file="irae_lung_sct_Seurat.rds")
 DefaultAssay(merged_Seurat) <- "SCT"

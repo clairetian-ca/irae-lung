@@ -215,8 +215,8 @@ write.csv(table_all, "cell_counts_all.csv")
 ```{r}
 # harmony_seurat <- JoinLayers(harmony_seurat) # no need, since SCTAssay is v4 style and not layered
 
-DefaultAssay(harmony_seurat) <- "SCT"
-harmony_seurat <- PrepSCTFindMarkers(harmony_seurat)
+DefaultAssay(harmony_seurat) <- "RNA"
+#harmony_seurat <- PrepSCTFindMarkers(harmony_seurat)
 markers <- FindAllMarkers(harmony_seurat, only.pos = TRUE, min.pct = 0.25,
 logfc.threshold = 0.25,slot = "data",test.use ="wilcox",return.thresh = 0.1)
 ```

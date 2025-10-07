@@ -1,9 +1,15 @@
+---
+title: "irAE Lung Cancer"
+output: html_notebook
+---
+
 ```{r}
 library(Seurat)
 library(cellranger)
 library(hdf5r)
 library(harmony)
 library(SingleCellExperiment)
+library(scDblFinder)
 library(Seurat)
 library(ggplot2)
 library(ggbeeswarm)
@@ -17,15 +23,16 @@ getwd()
 ```{r setup, include=FALSE}
 knitr::opts_chunk$set(echo = TRUE)
 options(Seurat.object.assay.version = 'v5')
-start_step <- 3
+start_step <- 1
 options(start_step = start_step)
-
 ```
+
 ```{r step1, eval = getOption("start_step", 1) < 2}
 print("✅ Running Step 1: Loading data...")
 # List all sample directories containing 10x data
 sample_dirs <- list.dirs("GSE216329_RAW_lung", recursive = FALSE, full.names = TRUE)
 sample_dirs <- sample_dirs[file.exists(file.path(sample_dirs, "matrix.mtx.gz"))]
+# sample_dirs <- sample_dirs[!grepl("_P6_T$|_P6_TN$", basename(sample_dirs))]
 sample_dirs
 
 # Read each sample and create a Seurat object
@@ -35,7 +42,7 @@ read_sample_as_seurat <- function(path) {
     gene.column = 2,
     unique.features = TRUE
   )
-  colnames(counts) <- make.unique(colnames(counts))
+  colnames(counts) <- make.unique(colnames(counts)) # likely not needed, 
   sample_id <- basename(path)
   CreateSeuratObject(
     counts = counts,
@@ -46,6 +53,55 @@ read_sample_as_seurat <- function(path) {
 }
 seurat_list <- lapply(sample_dirs, read_sample_as_seurat)
 
+# ---- 2) QC & filtering (per-sample) ----
+seurat_list <- lapply(seurat_list, function(s) {
+  s[["percent.mt"]] <- PercentageFeatureSet(s, pattern = "^MT-")
+  subset(s, subset = nFeature_RNA >= 200 & nFeature_RNA <= 6000 &
+                 nCount_RNA   <= 60000 & percent.mt <= 15)
+})
+
+# ---- 3) Doublet detection per sample (on raw counts) ----
+seurat_list <- lapply(seurat_list, function(s) {
+  sce <- as.SingleCellExperiment(s, assay = "RNA")
+  sce <- scDblFinder(sce)  # adds colData 'scDblFinder.class'
+  s$doublet_class <- colData(sce)$scDblFinder.class
+  s
+})
+
+# ---- 3a) Doublet validation (before filtering) ----
+# Overall class counts per sample
+doublet_stats <- lapply(seurat_list, function(s) table(s$doublet_class, useNA = "ifany"))
+doublet_stats
+
+# Per-sample doublet rates and CSV export
+per_sample <- lapply(seurat_list, function(s) {
+  smp <- if (!is.null(s$orig.ident)) unique(as.character(s$orig.ident)) else NA_character_
+  tab <- table(s$doublet_class)
+  total <- sum(tab)
+  dbl <- if ("doublet" %in% names(tab)) as.integer(tab[["doublet"]]) else 0L
+  data.frame(sample = smp, total = total, doublet = dbl,
+             doublet_rate = ifelse(total > 0, round(100 * dbl / total, 2), NA_real_))
+})
+per_sample_df <- do.call(rbind, per_sample)
+print(per_sample_df)
+try(utils::write.csv(per_sample_df, file = "scDblFinder_per_sample_rates.csv", row.names = FALSE), silent = TRUE)
+
+# Violin plots comparing singlets vs doublets for QC metrics, per sample
+invisible(lapply(seurat_list, function(s) {
+  if (!"percent.mt" %in% colnames(s@meta.data)) {
+    s[["percent.mt"]] <- PercentageFeatureSet(s, pattern = "^MT-")
+  }
+  feat_meta <- intersect(c("nFeature_RNA", "nCount_RNA", "percent.mt"), colnames(s@meta.data))
+  if (length(feat_meta) > 0 && "doublet_class" %in% colnames(s@meta.data)) {
+    v1 <- try(VlnPlot(s, features = feat_meta, group.by = "doublet_class", pt.size = 0, combine = TRUE), silent = TRUE)
+    if (!inherits(v1, "try-error")) print(v1)
+  }
+}))
+
+# ---- 3b) Filter out called doublets ----
+seurat_list <- lapply(seurat_list, function(s) subset(s, subset = doublet_class != "doublet"))
+
+
 # Merge all samples
 merged_Seurat <- merge(
   x = seurat_list[[1]],
@@ -55,42 +111,43 @@ merged_Seurat <- merge(
 )
 cat("Merged", length(seurat_list), "samples. Total cells:", ncol(merged_Seurat), "\n")
 
+# Split RNA layers by sample - not needed, already split
+# merged_Seurat[["RNA"]] <- split(merged_Seurat[["RNA"]], f = merged_Seurat$orig.ident)
+# merged_Seurat <- DietSeurat(merged_Seurat, counts = FALSE, data = TRUE, scale.data = FALSE)
+
+merged_Seurat[["RNA"]] <- JoinLayers(merged_Seurat[["RNA"]])
+
+DefaultAssay(merged_Seurat) <- "RNA"
+
 merged_Seurat
 saveRDS(merged_Seurat, file="irae_lung_merged_Seurat.rds")
 
 ```
+
 ```{r step2, eval = getOption("start_step", 1) < 3}
 print("✅ Running Step 2: Normalizing data...")
-merged_Seurat <- readRDS(file="irae_lung_merged_Seurat.rds")
-merged_Seurat <- NormalizeData(merged_Seurat, normalization.method ="LogNormalize", scale.factor = 10000)
+# merged_Seurat <- readRDS(file="irae_lung_merged_Seurat.rds")
+merged_Seurat <- NormalizeData(merged_Seurat, normalization.method ="LogNormalize") #, scale.factor = 10000)
 merged_Seurat <- FindVariableFeatures(merged_Seurat, selection.method = "vst", nfeatures = 2000)
-saveRDS(merged_Seurat, file="irae_lung_variable_features_Seurat.rds")
+length(VariableFeatures(merged_Seurat))
+# saveRDS(merged_Seurat, file="irae_lung_variable_features_Seurat.rds")
 
 ```
 ```{r step3, eval = getOption("start_step", 1) < 4}
 
-merged_Seurat <- readRDS(file="irae_lung_variable_features_Seurat.rds")
-merged_Seurat <- ScaleData(merged_Seurat, features = VariableFeatures(merged_Seurat), verbose=FALSE)
-saveRDS(merged_Seurat, file="irae_lung_scaled_Seurat.rds")
+# merged_Seurat <- readRDS(file="irae_lung_variable_features_Seurat.rds")
+merged_Seurat <- ScaleData(merged_Seurat, features = VariableFeatures(merged_Seurat))
+# saveRDS(merged_Seurat, file="irae_lung_scaled_Seurat.rds")
 ```
-```{r step3, eval = getOption("start_step", 1) < 5}
+```{r step4, eval = getOption("start_step", 1) < 5}
 print("✅ Running Step 3: PCA and UMAP..")
 merged_Seurat <- RunPCA(merged_Seurat, features = VariableFeatures(object = merged_Seurat), npcs = 30)
-merged_Seurat <- RunUMAP(merged_Seurat,dims = 1:30, reduction = "pca")
-```
-```{r}
+# merged_Seurat <- RunUMAP(merged_Seurat,dims = 1:30, reduction = "pca")
 PCAPlot(merged_Seurat,group.by="orig.ident",label = FALSE)
 ```
 ```{r}
 harmony_seurat <- RunHarmony(merged_Seurat,group.by.vars=c("orig.ident"))
-```
-```{r}
-saveRDS(merged_Seurat, file="irae_lung_seurat.RDS")
-```
-```{r}
 merged_Seurat
-```
-```{r}
 harmony_seurat
 ```
 ```{r}
